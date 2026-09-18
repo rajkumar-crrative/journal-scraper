@@ -182,7 +182,7 @@ def extract_api():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        res = requests.get(url, headers=headers, timeout=60)
         soup = BeautifulSoup(res.text, 'html.parser')
 
         # 1. HTML Extraction
