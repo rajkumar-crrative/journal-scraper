@@ -1,96 +1,126 @@
 import re
-import requests
+import io
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, Response, stream_with_context
 from urllib.parse import urljoin, urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# PDF Support Check
+try:
+    import PyPDF2
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
 
 app = Flask(__name__)
 
-# Headers to bypass basic bot protection
+# Full Security Headers to protect backend identity & stop hackers
+@app.after_request
+def apply_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Server'] = 'Secure-Engine'
+    return response
+
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 }
 
 def clean_and_format_email(email_str):
-    """Normalize emails that use [at], (at), [dot], etc."""
     email = email_str.lower().strip()
     email = re.sub(r'\s*[\(\[\{]at[\)\]\}]\s*', '@', email)
     email = re.sub(r'\s*[\(\[\{]dot[\)\]\}]\s*', '.', email)
     return email
 
 def extract_emails_from_text(text):
-    """Advanced regex to capture standard and obfuscated emails."""
-    # Standard email pattern
     standard_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    # Obfuscated pattern like name[at]domain[dot]com
     obfuscated_pattern = r'[a-zA-Z0-9._%+-]+\s*[\(\[\{]at[\)\]\}]\s*[a-zA-Z0-9.-]+\s*[\(\[\{]dot[\)\]\}]\s*[a-zA-Z]{2,}'
     
-    found_emails = re.findall(standard_pattern, text)
-    obfuscated_matches = re.findall(obfuscated_pattern, text, re.IGNORECASE)
+    found = re.findall(standard_pattern, text)
+    obf_matches = re.findall(obfuscated_pattern, text, re.IGNORECASE)
     
-    for match in obfuscated_matches:
-        cleaned = clean_and_format_email(match)
-        found_emails.append(cleaned)
+    for match in obf_matches:
+        found.append(clean_and_format_email(match))
         
-    return set(found_emails)
+    return set(found)
 
-def fetch_and_extract(url):
-    """Fetch single page content and extract emails & sub-links."""
+def read_pdf_bytes(pdf_bytes):
     emails = set()
-    links = set()
+    if not PDF_SUPPORT:
+        return emails
     try:
-        response = requests.get(url, headers=HEADERS, timeout=8)
-        if response.status_code == 200:
-            # Extract from raw text
-            emails.update(extract_emails_from_text(response.text))
-            
-            # Extract mailto links and sub-links
-            soup = BeautifulSoup(response.text, 'html.parser')
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href'].strip()
-                if href.startswith('mailto:'):
-                    clean_email = href.replace('mailto:', '').split('?')[0].strip()
-                    if '@' in clean_email:
-                        emails.add(clean_email.lower())
-                else:
-                    full_url = urljoin(url, href)
-                    # Filter same domain links for deep scanning
-                    if urlparse(full_url).netloc == urlparse(url).netloc:
-                        links.add(full_url)
+        pdf_file = io.BytesIO(pdf_bytes)
+        reader = PyPDF2.PdfReader(pdf_file)
+        for page in reader.pages[:3]:
+            txt = page.extract_text()
+            if txt:
+                emails.update(extract_emails_from_text(txt))
     except Exception:
         pass
-    return emails, links
+    return emails
 
-def fast_deep_scrape(base_url, max_pages=15):
-    """Multi-threaded deep scraper for large sites."""
+async def fetch_page(session, url):
+    try:
+        async with session.get(url, headers=HEADERS, timeout=6, ssl=False) as resp:
+            if resp.status == 200:
+                c_type = resp.headers.get('Content-Type', '').lower()
+                if 'application/pdf' in c_type or url.endswith('.pdf'):
+                    pdf_b = await resp.read()
+                    return read_pdf_bytes(pdf_b), set()
+                
+                html = await resp.text()
+                emails = extract_emails_from_text(html)
+                soup = BeautifulSoup(html, 'html.parser')
+                links = set()
+                
+                for a in soup.find_all('a', href=True):
+                    href = a['href'].strip()
+                    if href.startswith('mailto:'):
+                        e = href.replace('mailto:', '').split('?')[0].strip()
+                        if '@' in e:
+                            emails.add(e.lower())
+                    else:
+                        full_url = urljoin(url, href)
+                        if urlparse(full_url).netloc == urlparse(url).netloc or full_url.endswith('.pdf'):
+                            links.add(full_url)
+                return emails, links
+    except Exception:
+        pass
+    return set(), set()
+
+async def stream_1500_crawler(base_url, max_pages=1500):
     visited = set()
     to_visit = {base_url}
     all_emails = set()
     
-    # ThreadPoolExecutor for fast parallel requests
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    connector = aiohttp.TCPConnector(limit=100, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
         while to_visit and len(visited) < max_pages:
-            current_batch = list(to_visit - visited)[:10]
-            visited.update(current_batch)
-            to_visit.difference_update(current_batch)
+            batch = list(to_visit - visited)[:50]
+            if not batch:
+                break
+                
+            visited.update(batch)
+            to_visit.difference_update(batch)
             
-            future_to_url = {executor.submit(fetch_and_extract, url): url for url in current_batch}
+            tasks = [fetch_page(session, u) for u in batch]
+            results = await asyncio.gather(*tasks)
             
-            for future in as_completed(future_to_url):
-                emails, links = future.result()
-                all_emails.update(emails)
-                # Add new discovered links to visit
-                for link in links:
-                    if link not in visited:
-                        to_visit.add(link)
-                        
-    # Filter unwanted extensions falsely caught as emails
-    valid_emails = [
-        e for e in all_emails 
-        if not e.endswith(('.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg'))
-    ]
-    return sorted(list(set(valid_emails)))
+            new_found = set()
+            for ems, lks in results:
+                new_found.update(ems)
+                for l in lks:
+                    if l not in visited and len(visited) + len(to_visit) < max_pages:
+                        to_visit.add(l)
+            
+            added_emails = new_found - all_emails
+            if added_emails:
+                all_emails.update(added_emails)
+                yield f"data: {list(added_emails)}\n\n"
+                
+            await asyncio.sleep(0.01)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -98,54 +128,86 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fast Deep Email Extractor Pro</title>
+    <title>Enterprise Speed & Secure Email Extractor</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #0f172a; color: #fff; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: auto; background: #1e293b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
-        h2 { text-align: center; color: #38bdf8; margin-bottom: 20px; }
-        .input-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; color: #94a3b8; }
-        input[type="url"] { width: 100%; padding: 12px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #0284c7; border: none; color: #fff; font-size: 16px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        button:hover { background: #0369a1; }
-        .result-box { margin-top: 20px; }
-        textarea { width: 100%; height: 250px; background: #0f172a; border: 1px solid #334155; color: #4ade80; padding: 10px; border-radius: 6px; box-sizing: border-box; }
-        .status { margin-top: 10px; color: #facc15; font-size: 14px; text-align: center; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #090d16; color: #e2e8f0; margin: 0; padding: 20px; }
+        .container { max-width: 850px; margin: auto; background: #111827; padding: 30px; border-radius: 12px; border: 1px solid #1f2937; }
+        h2 { text-align: center; color: #38bdf8; font-size: 24px; margin-bottom: 20px; }
+        input[type="url"] { width: 100%; padding: 14px; border-radius: 8px; border: 1px solid #374151; background: #030712; color: #fff; box-sizing: border-box; font-size: 16px; margin-bottom: 15px; }
+        button { width: 100%; padding: 14px; background: #2563eb; border: none; color: #fff; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+        button:hover { background: #1d4ed8; }
+        #results { width: 100%; height: 350px; background: #030712; border: 1px solid #374151; color: #4ade80; padding: 12px; border-radius: 8px; box-sizing: border-box; margin-top: 15px; font-family: monospace; white-space: pre-wrap; overflow-y: auto; }
+        .counter { color: #facc15; font-weight: bold; margin-top: 10px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h2>⚡ High-Speed Deep Email Extractor</h2>
-        <form method="POST" action="/extract">
-            <div class="input-group">
-                <label for="url">Website / Journal URL Enter Karein:</label>
-                <input type="url" id="url" name="url" placeholder="https://example-journal.com/issue-1" required>
-            </div>
-            <button type="submit">Start Fast Deep Extraction</button>
-        </form>
+        <h2>⚡ Enterprise Secure 1500+ PDF & HTML Extractor</h2>
+        <input type="url" id="urlInput" placeholder="Enter Journal / Website Main Link..." required>
+        <button onclick="startScanning()">Start Super-Fast Secure Scan</button>
         
-        {% if emails is not none %}
-        <div class="result-box">
-            <h3>Extracted Emails (Total: {{ emails|length }}):</h3>
-            <textarea readonly>{{ emails | join('\n') }}</textarea>
-        </div>
-        {% endif %}
+        <div class="counter">Live Emails Extracted: <span id="count">0</span></div>
+        <div id="results"></div>
     </div>
+
+    <script>
+        let uniqueEmails = new Set();
+        function startScanning() {
+            const url = document.getElementById('urlInput').value;
+            if(!url) return alert('Link daliye!');
+            
+            const resultsBox = document.getElementById('results');
+            const countBox = document.getElementById('count');
+            resultsBox.innerText = "Scanning started... Scanning 1500+ pages & PDFs...\n";
+            uniqueEmails.clear();
+            countBox.innerText = "0";
+
+            const eventSource = new EventSource('/stream?url=' + encodeURIComponent(url));
+            eventSource.onmessage = function(event) {
+                const emails = JSON.parse(event.data.replace(/'/g, '"'));
+                emails.forEach(email => {
+                    if(!uniqueEmails.has(email)) {
+                        uniqueEmails.add(email);
+                        resultsBox.innerText += email + "\n";
+                    }
+                });
+                countBox.innerText = uniqueEmails.size;
+            };
+
+            eventSource.onerror = function() {
+                eventSource.close();
+                resultsBox.innerText += "\n--- Scanning Completed ---";
+            };
+        }
+    </script>
 </body>
 </html>
 """
 
-@app.route('/', methods=['GET'])
+@app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, emails=None)
+    return render_template_string(HTML_TEMPLATE)
 
-@app.route('/extract', methods=['POST'])
-def extract():
-    target_url = request.form.get('url')
-    if target_url:
-        found_emails = fast_deep_scrape(target_url, max_pages=15)
-        return render_template_string(HTML_TEMPLATE, emails=found_emails)
-    return render_template_string(HTML_TEMPLATE, emails=[])
+@app.route('/stream')
+def stream():
+    target_url = request.args.get('url')
+    if not target_url:
+        return Response("URL required", status=400)
+
+    def generate():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        crawler = stream_1500_crawler(target_url, max_pages=1500)
+        try:
+            while True:
+                data = loop.run_until_complete(crawler.__anext__())
+                yield data
+        except StopAsyncIteration:
+            pass
+        finally:
+            loop.close()
+
+    return Response(stream_with_context(generate()), content_type='text/event-stream')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=False)
