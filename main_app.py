@@ -50,7 +50,7 @@ from PyPDF2 import PdfReader
 # Configuration & Security Setup
 # ---------------------------------------------------------------------------
 
-APP = Flask(__name__)
+app = Flask(__name__)
 APP.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
 DATA_DIR = Path(os.environ.get("SCRAPER_DATA_DIR", "./scraper_data"))
