@@ -53,8 +53,18 @@ from PyPDF2 import PdfReader
 app = Flask(__name__)
 APP.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
-DATA_DIR = Path(os.environ.get("SCRAPER_DATA_DIR", "./scraper_data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+import tempfile
+
+# Vercel के सर्वर क्रैश को रोकने के लिए सुरक्षित पाथ सेट अप
+if os.environ.get("VERCEL"):
+    DATA_DIR = Path(tempfile.gettempdir()) / "scraper_data"
+else:
+    DATA_DIR = Path("./scraper_data")
+
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 RESULTS_DIR = DATA_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
