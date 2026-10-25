@@ -51,7 +51,7 @@ from PyPDF2 import PdfReader
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
-APP.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
 import tempfile
 
