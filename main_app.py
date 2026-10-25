@@ -569,7 +569,7 @@ data.records.forEach((rec, idx) => {
     }
     validRecordsCount++;
     let emailBadges = rec.all_emails.map(e => { 
-        globalAllEmails.png(e); // (या globalAllEmails.push(e))
+        globalAllEmails.push(e); 
         return `<span class="email-badge">${e}</span>`; 
     }).join('');
     
