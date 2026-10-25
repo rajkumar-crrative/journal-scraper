@@ -21,7 +21,7 @@ BLOCKED_URL_KEYWORDS = [
     '/about', '/editorialteam', '/privacy', '/submissions', 
     '/contact', '/announcements', '/indexing', '/search', '/index',
     '/abouttheauthors', '/policies', '/peerreview', '/guidelines',
-    '/issue/archive', '/volume/', '/browse'
+   '/browse'
 ]
 
 def is_valid_author_email(email):
