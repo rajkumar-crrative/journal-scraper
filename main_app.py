@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Vercel Serverless-Optimized OJS PDF Email Scraper
+app.py - Ultimate Robust OJS & PDF Scraper for Vercel
 """
 import io
 import os
@@ -18,10 +18,9 @@ from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
-MAX_ARTICLES = 50
+MAX_ARTICLES = 40
 PDF_PAGES = 3
-MAX_PDF_BYTES = 30 * 1024 * 1024
-MAX_HTML_BYTES = 4 * 1024 * 1024
+MAX_PDF_BYTES = 25 * 1024 * 1024
 TIMEOUT = (10, 30)
 
 BROWSER_HEADERS = {
@@ -47,9 +46,6 @@ def decode_html(body, ctype):
             continue
     return body.decode("utf-8", "replace")
 
-# ==============================================================================
-# OJS ARTICLE DISCOVERY & ID DEDUPLICATION (4 की जगह 4 ही गिनेगा)
-# ==============================================================================
 def discover_articles(html_text, issue_url):
     soup = BeautifulSoup(html_text, "html.parser")
     h1 = soup.find("h1")
@@ -64,7 +60,6 @@ def discover_articles(html_text, issue_url):
         href = a["href"].strip()
         full_url = urljoin(issue_url, href)
         
-        # सटीक आर्टिकल आईडी निकालना ताकि डुप्लीकेट न हों
         match = re.search(r'/article/(?:view|download|viewFile)/(\d+)', full_url)
         if not match:
             match = re.search(r'/view/(\d+)/\d+', full_url)
@@ -91,9 +86,6 @@ def discover_articles(html_text, issue_url):
 
     return issue_title, list(articles_map.values())[:MAX_ARTICLES]
 
-# ==============================================================================
-# EMAIL FILTRATION & PDF PARSING
-# ==============================================================================
 BLOCKED_PREFIXES = {
     "info", "support", "editor", "editors", "editorial", "editorialoffice", "editorinchief",
     "admin", "administrator", "queries", "webmaster", "noreply", "contact", "office",
@@ -132,28 +124,15 @@ def is_allowed(email, journal_base):
     norm = re.sub(r"[^a-z]", "", local)
     return norm not in BLOCKED_PREFIXES
 
-def pdf_first_pages_text(data):
-    reader = PdfReader(io.BytesIO(data), strict=False)
-    if reader.is_encrypted:
-        reader.decrypt("")
-    parts = []
-    for page in reader.pages[:PDF_PAGES]:
-        try:
-            parts.append(page.extract_text() or "")
-        except Exception:
-            parts.append("")
-    return "\n".join(parts)
-
 def process_single_article(session, art, journal_base):
-    emails = []
-    status = "error"
-    note = ""
     candidates = list(art["pdf_candidates"])
+    html_raw_text = ""
     
     try:
         r = session.get(art["view_url"], timeout=TIMEOUT, headers=BROWSER_HEADERS)
         if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
+            html_raw_text = r.text
+            soup = BeautifulSoup(html_raw_text, "html.parser")
             m_title = soup.find("meta", attrs={"name": "citation_title"})
             if m_title and m_title.get("content"):
                 art["title"] = m_title["content"].strip()
@@ -174,37 +153,41 @@ def process_single_article(session, art, journal_base):
             std_download = art["view_url"].replace("/view/", "/download/")
             if std_download not in candidates:
                 candidates.append(std_download)
-    except Exception as e:
-        note = f"Page error: {str(e)}"
+    except Exception:
+        pass
 
+    # 1. पहले PDF से ईमेल ढूँढने की कोशिश करें
     pdf_data = None
     for url in candidates:
         try:
             r = session.get(url, timeout=TIMEOUT, headers=BROWSER_HEADERS)
-            if r.status_code == 200 and (b"%PDF-" in r.content[:1024] or 'pdf' in r.headers.get('content-type', '').lower()):
+            if r.status_code == 200 and len(r.content) > 1000:
                 pdf_data = r.content
                 break
         except Exception:
             continue
             
-    if pdf_data is None:
-        return [], "error", note or "PDF download failed."
-        
-    try:
-        text = pdf_first_pages_text(pdf_data)
-    except Exception:
-        return [], "error", "PDF parsing failed."
-        
-    if not text.strip():
-        return [], "no_text", "PDF text is empty."
-        
-    extracted = [e for e in find_emails(text) if is_allowed(e, journal_base)]
-    status = "ok" if extracted else "no_emails"
-    return extracted, status, ("" if extracted else "No author email found.")
+    extracted = []
+    if pdf_data:
+        try:
+            reader = PdfReader(io.BytesIO(pdf_data), strict=False)
+            if reader.is_encrypted:
+                reader.decrypt("")
+            full_pdf_text = ""
+            for page in reader.pages[:PDF_PAGES]:
+                full_pdf_text += (page.extract_text() or "") + "\n"
+            extracted = [e for e in find_emails(full_pdf_text) if is_allowed(e, journal_base)]
+        except Exception:
+            pass
 
-# ==============================================================================
-# FLASK ROUTES
-# ==============================================================================
+    # 2. अगर PDF से ईमेल न मिले, तो HTML पेज से फॉलबैक करके ढूँढें (Fallback to HTML metadata/text)
+    if not extracted and html_raw_text:
+        extracted = [e for e in find_emails(html_raw_text) if is_allowed(e, journal_base)]
+
+    status = "ok" if extracted else "no_emails"
+    note = "" if extracted else "No author email found in PDF/HTML."
+    return extracted, status, note
+
 @app.route("/")
 def index():
     return render_template_string(PAGE)
@@ -261,15 +244,12 @@ def api_scrape():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ==============================================================================
-# FRONTEND UI
-# ==============================================================================
 PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Vercel-Optimized OJS Scraper</title>
+    <title>Robust OJS Scraper</title>
     <style>
         body { font-family: sans-serif; background: #0b0f19; color: #fff; padding: 30px; max-width: 900px; margin: auto; }
         .card { background: #172036; padding: 25px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
@@ -283,9 +263,9 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
     <div class="card">
-        <h2>👑 Vercel-Optimized OJS PDF Email Scraper</h2>
+        <h2>👑 Robust OJS PDF & HTML Scraper</h2>
         <input id="url" type="text" placeholder="Paste Issue URL (e.g., https://jaat.fudutsinma.edu.ng/index.php/jaat/issue/view/19)">
-        <button onclick="startScraping()">Launch Direct Extraction</button>
+        <button onclick="startScraping()">Launch Extraction</button>
         <div id="status" style="margin-top:15px;color:#94a3b8">Ready</div>
     </div>
 
@@ -308,7 +288,7 @@ PAGE = r"""<!doctype html>
             if(!url) return alert('कृपया OJS Issue URL डालें!');
             
             const statusEl = document.getElementById('status');
-            statusEl.innerText = 'Scraping articles and cracking PDFs directly... Please wait.';
+            statusEl.innerText = 'Scanning PDFs and fallback HTML... Please wait.';
             
             try {
                 const res = await fetch('/api/scrape', {
