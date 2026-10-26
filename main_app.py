@@ -16,7 +16,8 @@ BLOCKED_EMAIL_PREFIXES = (
     'privacy@', 'contact@', 'admin@', 'queries@', 'editorial@', 
     'nepjol@', 'ubiquitypress@', 'webmaster@', 'noreply@', 'office@',
     'secretary@', 'managing@', 'production@', 'proofreader@', 'publisher@',
-    'sales@', 'marketing@', 'finance@', 'events@', 'media@', 'permissions@'
+    'sales@', 'marketing@', 'finance@', 'events@', 'media@', 'permissions@',
+    'fudutsinma.edu.ng'
 )
 
 def is_valid_author_email(email):
@@ -25,8 +26,7 @@ def is_valid_author_email(email):
         return False
     if any(email_lower.startswith(prefix) for prefix in BLOCKED_EMAIL_PREFIXES):
         return False
-    # जेनेरिक पब्लिशर डोमेन को ब्लॉक करना जब तक कि पर्सनल/एजुकेशनल डोमेन न हो
-    if any(domain in email_lower for domain in ['nepjol.info', 'ubiquitypress.com', 'mdpi.com', 'journals.org', 'ojs.']):
+    if any(domain in email_lower for domain in ['fudutsinma.edu.ng', 'nepjol.info', 'ubiquitypress.com', 'mdpi.com', 'journals.org', 'ojs.']):
         if not any(edu in email_lower for edu in ['gmail.com', 'yahoo.com', 'edu', 'ac.in', 'outlook.com', 'hotmail.com']):
             return False
     return True
@@ -44,7 +44,6 @@ def fetch_page(url):
     return None
 
 def extract_emails_with_proximity(text, source_url):
-    """प्रॉक्सिमिटी (नजदीकी) और कॉरेस्पोंडिंग ऑथर कीवर्ड्स के आधार पर ईमेल निकालना"""
     valid_emails = []
     raw_emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
     
@@ -72,18 +71,18 @@ def extract_emails_with_proximity(text, source_url):
                 
     return valid_emails
 
-def parse_pdf_for_author_emails(pdf_url):
-    """PDF फाइल को डाउनलोड करके उसके पहले पन्नों से कॉरेस्पोंडिंग ऑथर का ईमेल निकालना"""
+def parse_pdf_for_author_emails(pdf_url, base_url):
     try:
+        full_pdf_url = pdf_url if pdf_url.startswith('http') else base_url.rstrip('/') + '/' + pdf_url.lstrip('/')
         headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(pdf_url, headers=headers, timeout=20)
+        resp = requests.get(full_pdf_url, headers=headers, timeout=20)
         if resp.status_code == 200:
             pdf_file = io.BytesIO(resp.content)
             reader = pypdf.PdfReader(pdf_file)
             full_text = ""
             for page in reader.pages[:2]:
                 full_text += page.extract_text() + "\n"
-            return extract_emails_with_proximity(full_text, pdf_url)
+            return extract_emails_with_proximity(full_text, full_pdf_url)
     except Exception:
         pass
     return []
@@ -101,9 +100,11 @@ def process_article_page(article_url):
     if len(emails) == 0:
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
-            if '/pdf/' in href.lower() or href.lower().endswith('.pdf'):
-                pdf_link = href if href.startswith('http') else os.path.dirname(article_url) + '/' + href
-                pdf_emails = parse_pdf_for_author_emails(pdf_link)
+            href_lower = href.lower()
+            if ('/pdf/' in href_lower) or (href_lower.endswith('.pdf')) or ('/download/' in href_lower) or (re.search(r'/view/\d+/\d+', href_lower)):
+                parsed_url = requests.utils.urlparse(article_url)
+                base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                pdf_emails = parse_pdf_for_author_emails(href, base_domain)
                 for pe in pdf_emails:
                     if pe not in emails:
                         emails.append(pe)
@@ -112,7 +113,7 @@ def process_article_page(article_url):
     return emails
 
 # ==========================================
-# FRONTEND UI (TWO STATS BOXES & NUMBERED LIST)
+# FRONTEND UI
 # ==========================================
 @app.route('/')
 def home():
@@ -157,7 +158,7 @@ def home():
             <h2>👑 Masterclass Enterprise Email Tracker</h2>
             <p class="sub">Precision Corresponding Author Extraction Engine (Boss Edition)</p>
             
-            <input type="text" id="targetUrl" placeholder="Enter Journal Issue / Volume URL (e.g., NepJOL Issue View URL)">
+            <input type="text" id="targetUrl" placeholder="Enter Journal Issue / Volume URL">
             <button class="btn" onclick="startScraping()">Launch Masterclass Tracker</button>
             
             <div class="terminal" id="terminalBox" style="display:none;">
@@ -261,22 +262,25 @@ def scan_journal():
     
     article_links = []
     
-    # कंटेनर-बेस्ड सटीक आर्टिकल लिंक्स ढूंढना
-    summary_divs = soup.find_all(class_=re.compile(r'(obj_article_summary|article-summary|row|item)', re.I))
+    summary_divs = soup.find_all(class_=re.compile(r'(obj_article_summary|article-summary|row|item|title)', re.I))
     if summary_divs:
         for div in summary_divs:
             for a_tag in div.find_all('a', href=True):
                 href = a_tag['href']
                 if '/article/view/' in href.lower() or '/view/' in href.lower():
-                    full_url = href if href.startswith('http') else os.path.dirname(issue_url) + '/' + href
-                    if full_url not in article_links:
+                    parsed_url = requests.utils.urlparse(issue_url)
+                    base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                    full_url = href if href.startswith('http') else base_domain + ('/' + href.lstrip('/') if not href.startswith('/') else href)
+                    if full_url not in article_links and 'issue' not in full_url.lower():
                         article_links.append(full_url)
                         
     if not article_links:
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
-            if '/article/view/' in href.lower():
-                full_url = href if href.startswith('http') else os.path.dirname(issue_url) + '/' + href
+            if '/article/view/' in href.lower() and 'issue' not in href.lower():
+                parsed_url = requests.utils.urlparse(issue_url)
+                base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                full_url = href if href.startswith('http') else base_domain + ('/' + href.lstrip('/') if not href.startswith('/') else href)
                 if full_url not in article_links:
                     article_links.append(full_url)
                     
