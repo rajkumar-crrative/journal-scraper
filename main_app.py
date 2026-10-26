@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Ultra-Robust OJS issue scraper with Anti-Bot Headers and Direct PDF Cracking.
+app.py - Final Bulletproof OJS Scraper (Exact Article ID Deduplication & Direct PDF Cracking)
 """
 import io
 import os
@@ -13,7 +13,7 @@ import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -31,16 +31,12 @@ WORKERS = 6
 PDF_PAGES = 3
 MAX_PDF_BYTES = 35 * 1024 * 1024
 MAX_HTML_BYTES = 5 * 1024 * 1024
-TIMEOUT = (10, 35)
+TIMEOUT = (15, 45)
 
-# असली ब्राउज़र जैसे हेडर्स ताकि जर्नल सर्वर बॉट समझकर ब्लॉक न करे
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1"
 }
 
 def make_session():
@@ -67,25 +63,22 @@ def assert_public(url):
             raise ValueError("Private or internal addresses are blocked.")
 
 def safe_get(session, url, max_bytes, accept="*/*"):
-    for _ in range(6):
+    for _ in range(5):
         assert_public(url)
         headers = dict(BROWSER_HEADERS)
         headers["Accept"] = accept
-        r = session.get(url, timeout=TIMEOUT, stream=True, allow_redirects=False, headers=headers)
+        r = session.get(url, timeout=TIMEOUT, stream=True, allow_redirects=True, headers=headers)
         try:
-            if r.is_redirect and r.headers.get("Location"):
-                url = urljoin(url, r.headers["Location"])
-                continue
             r.raise_for_status()
             buf = bytearray()
             for chunk in r.iter_content(65536):
                 buf += chunk
                 if len(buf) > max_bytes:
                     raise ValueError("File is too large.")
-            return url, r.headers.get("Content-Type", ""), bytes(buf)
+            return r.url, r.headers.get("Content-Type", ""), bytes(buf)
         finally:
             r.close()
-    raise ValueError("Too many redirects.")
+    raise ValueError("Too many redirects or failed request.")
 
 def decode_html(body, ctype):
     for enc in ("utf-8", (re.search(r"charset=([\w\-]+)", ctype or "", re.I) or [None, "latin-1"])[1], "latin-1"):
@@ -95,52 +88,65 @@ def decode_html(body, ctype):
             continue
     return body.decode("utf-8", "replace")
 
-ART_RE = re.compile(r"^(?P<prefix>.*?/article)/(?:view|download|viewFile|viewArticle)/(?P<id>\d+)(?:/(?P<gal>\d+))?/?$", re.I)
-
+# ==============================================================================
+# STRICT ARTICLE DISCOVERY & ID DEDUPLICATION
+# ==============================================================================
 def discover_articles(html_text, issue_url):
     soup = BeautifulSoup(html_text, "html.parser")
     h1 = soup.find("h1")
     issue_title = h1.get_text(" ", strip=True) if h1 else (soup.title.get_text(strip=True) if soup.title else "")
     
-    for sel in ("nav", "footer", "aside", ".pkp_structure_sidebar", "#sidebar"):
-        for t in soup.select(sel):
-            t.decompose()
-            
-    scope = soup.select_one(".obj_issue_toc") or soup.select_one("main") or soup
-    arts, order = {}, []
+    articles_map = {}
     
-    for a in scope.find_all("a", href=True):
+    # इशू पेज पर मिलने वाले सभी लिंक्स को स्कैन करें और आर्टिकल ID निकालें
+    for a in soup.find_all("a", href=True):
         href = a["href"].strip()
-        if not href or href.startswith(("javascript:", "mailto:", "#")):
-            continue
-        p = urlparse(urljoin(issue_url, href.split("#")[0]))
-        m = ART_RE.match(p.path)
-        if not m or p.netloc != urlparse(issue_url).netloc:
-            continue
-        aid = m.group("id")
-        prefix = urlunparse((p.scheme, p.netloc, m.group("prefix"), "", "", ""))
-        rec = arts.get(aid)
-        if rec is None:
-            rec = arts[aid] = {"id": aid, "prefix": prefix, "title": "", "pdf_urls": [], "other_urls": []}
-            order.append(aid)
+        full_url = urljoin(issue_url, href)
+        
+        # OJS आर्टिकल यूआरएल पैटर्न: /article/view/{id} या /article/download/{id}
+        match = re.search(r'/article/(?:view|download|viewFile)/(\d+)', full_url)
+        if match:
+            aid = match.group(1)
+            if aid not in articles_map:
+                # बेस व्यू यूआरएल बनाएँ
+                parsed = urlparse(full_url)
+                base_prefix = f"{parsed.scheme}://{parsed.netloc}"
+                path_parts = parsed.path.split('/')
+                # OJS पाथ से बेस डोमेन और इंडेक्स ढूंढना
+                try:
+                    art_idx = path_parts.index('article')
+                    base_path = "/".join(path_parts[:art_idx+1])
+                    view_url = f"{base_prefix}{base_path}/view/{aid}"
+                except ValueError:
+                    view_url = f"{base_prefix}/index.php/jaat/article/view/{aid}"
+                
+                articles_map[aid] = {
+                    "id": aid,
+                    "title": "",
+                    "view_url": view_url,
+                    "pdf_candidates": []
+                }
             
-        text = a.get_text(" ", strip=True)
-        gal = m.group("gal")
-        if gal:
-            dl = f"{prefix}/download/{aid}/{gal}"
-            if dl not in rec["pdf_urls"]:
-                rec["pdf_urls"].append(dl)
-        elif not rec["title"] and len(text) >= 3:
-            rec["title"] = text
-            
+            # अगर लिंक PDF या डाउनलोड का है, तो उसे उम्मीदवार सूची में जोड़ें
+            text_lower = a.get_text(" ", strip=True).lower()
+            if 'pdf' in text_lower or '/download/' in full_url or '/viewFile/' in full_url:
+                if full_url not in articles_map[aid]["pdf_candidates"]:
+                    articles_map[aid]["pdf_candidates"].append(full_url)
+            elif not articles_map[aid]["title"] and len(text_lower) > 5 and 'issue' not in text_lower:
+                articles_map[aid]["title"] = a.get_text(" ", strip=True)
+
+    # अगर कुछ आर्टिकल्स के टाइटल खाली हैं, तो उन्हें डिफ़ॉल्ट नाम दें
     out = []
-    for aid in order[:MAX_ARTICLES]:
-        r = arts[aid]
-        r["view_url"] = f"{r['prefix']}/view/{aid}"
-        out.append(r)
+    for aid, rec in list(articles_map.items()[:MAX_ARTICLES]):
+        if not rec["title"]:
+            rec["title"] = f"Research Article #{aid}"
+        out.append(rec)
+        
     return issue_title, out
 
-# Email filtering & extraction rules
+# ==============================================================================
+# EMAIL FILTRATION & PDF PARSING
+# ==============================================================================
 BLOCKED_PREFIXES = {
     "info", "support", "editor", "editors", "editorial", "editorialoffice", "editorinchief",
     "admin", "administrator", "queries", "webmaster", "noreply", "contact", "office",
@@ -191,65 +197,78 @@ def pdf_first_pages_text(data):
             parts.append("")
     return "\n".join(parts)
 
-def fetch_pdf(session, url):
-    _, _, body = safe_get(session, url, MAX_PDF_BYTES, accept="application/pdf,*/*;q=0.8")
-    if body[:1024].find(b"%PDF-") != -1:
-        return body
-    raise ValueError("File content is not a valid PDF.")
-
 def process_article(session, art, journal_base):
     art["emails"], art["status"], art["note"] = [], "error", ""
-    candidates = list(art["pdf_urls"])
+    candidates = list(art["pdf_candidates"])
     
-    # यदि इशू पेज पर डायरेक्ट PDF लिंक नहीं मिले, तो आर्टिकल व्यू पेज खोलकर PDF ढूंढो
-    if not candidates or not art["title"]:
-        try:
-            _, ctype, body = safe_get(session, art["view_url"], MAX_HTML_BYTES, accept="text/html,*/*;q=0.8")
-            soup = BeautifulSoup(decode_html(body, ctype), "html.parser")
+    # 1. आर्टिकल का मुख्य पेज खोलकर असली PDF डाउनलोड लिंक ढूँढना
+    try:
+        final_url, ctype, body = safe_get(session, art["view_url"], MAX_HTML_BYTES, accept="text/html,*/*;q=0.8")
+        html_content = decode_html(body, ctype)
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # सही टाइटल अपडेट करें
+        m_title = soup.find("meta", attrs={"name": "citation_title"})
+        if m_title and m_title.get("content"):
+            art["title"] = m_title["content"].strip()
             
-            # टाइटल उठाओ
-            m = soup.find("meta", attrs={"name": "citation_title"})
-            if m and m.get("content"):
-                art["title"] = m["content"].strip()
+        # मेटा टैग से सीधा PDF यूआरएल लें
+        m_pdf = soup.find("meta", attrs={"name": "citation_pdf_url"})
+        if m_pdf and m_pdf.get("content"):
+            pdf_link = urljoin(final_url, m_pdf["content"])
+            if pdf_link not in candidates:
+                candidates.insert(0, pdf_link)
                 
-            # PDF लिंक या गैलरी ढूंढो
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/download/" in href or "/pdf" in href or href.endswith(".pdf"):
-                    full_u = urljoin(art["view_url"], href)
-                    if full_u not in candidates:
-                        candidates.append(full_u)
-        except Exception as e:
-            pass
+        # पेज के सभी लिंक्स से PDF / download लिंक ढूँढें
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/download/" in href or "/viewFile/" in href or href.endswith(".pdf"):
+                full_u = urljoin(final_url, href)
+                if full_u not in candidates:
+                    candidates.append(full_u)
+                    
+        # अगर OJS का स्टैंडर्ड डाउनलोड लिंक बना सकते हैं
+        std_download = art["view_url"].replace("/view/", "/download/")
+        if std_download not in candidates:
+            candidates.append(std_download)
+            
+    except Exception as e:
+        art["note"] = f"Could not load article page: {str(e)}"
 
-    data = None
-    for url in candidates[:4]:
+    # 2. PDF डाउनलोड करके क्रैक करना
+    pdf_data = None
+    for url in candidates:
         try:
-            data = fetch_pdf(session, url)
-            art["pdf_url"] = url
-            break
+            _, ctype, body = safe_get(session, url, MAX_PDF_BYTES, accept="application/pdf,*/*;q=0.8")
+            if body[:1024].find(b"%PDF-") != -1 or 'pdf' in ctype.lower():
+                pdf_data = body
+                art["pdf_url"] = url
+                break
         except Exception:
             continue
             
-    if data is None:
-        art["note"] = "PDF download failed or blocked by server."
+    if pdf_data is None:
+        art["note"] = "PDF could not be downloaded or blocked."
         return
         
     try:
-        text = pdf_first_pages_text(data)
+        text = pdf_first_pages_text(pdf_data)
     except Exception:
-        art["note"] = "Could not parse PDF file."
+        art["note"] = "PDF parsing failed."
         return
         
     if not text.strip():
-        art["status"], art["note"] = "no_text", "PDF text is empty (scanned image)."
+        art["status"], art["note"] = "no_text", "PDF has no extractable text."
         return
         
     art["emails"] = [e for e in find_emails(text) if is_allowed(e, journal_base)]
     art["status"] = "ok" if art["emails"] else "no_emails"
     if not art["emails"]:
-        art["note"] = "No author email found in PDF first pages."
+        art["note"] = "No author email found in first pages."
 
+# ==============================================================================
+# BACKGROUND JOBS & ROUTES
+# ==============================================================================
 def new_job(url):
     job = {"id": uuid.uuid4().hex, "url": url, "status": "queued", "issue_title": "", "total": 0, "processed": 0, "articles": [], "error": None, "created": time.time()}
     with JOBS_LOCK:
@@ -312,12 +331,12 @@ def api_status(job_id):
             if e not in seen:
                 seen.add(e)
                 emails.append(e)
-        arts.append({"id": a["id"], "title": a["title"] or f"Article {a['id']}", "url": a["view_url"], "emails": a["emails"], "status": a["status"], "note": a["note"]})
+        arts.append({"id": a["id"], "title": a["title"], "url": a["view_url"], "emails": a["emails"], "status": a["status"], "note": a["note"]})
     return jsonify({"status": job["status"], "error": job["error"], "issue_title": job["issue_title"], "total": job["total"], "processed": job["processed"], "emails": emails, "articles": arts, "journal_domain": job.get("journal_domain", "")})
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OJS PDF Scraper</title>
+<title>Bulletproof OJS PDF Scraper</title>
 <style>
 body{font-family:sans-serif;background:#0b0f19;color:#fff;padding:30px;max-width:900px;margin:auto}
 .card{background:#172036;padding:25px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);margin-bottom:20px}
@@ -328,7 +347,7 @@ button{padding:12px 20px;background:#22d3ee;border:none;color:#000;font-weight:b
 </style></head>
 <body>
 <div class="card">
-<h2>🚀 Anti-Bot OJS PDF Email Scraper</h2>
+<h2>👑 Bulletproof OJS PDF Email Scraper</h2>
 <input id="url" type="text" placeholder="Paste Issue URL (e.g., https://jaat.fudutsinma.edu.ng/index.php/jaat/issue/view/19)">
 <button onclick="start()">Start Scraping</button>
 <div id="status" style="margin-top:15px;color:#94a3b8">Ready</div>
