@@ -13,3 +13,4 @@ idna==3.19
 multidict==6.0.5
 yarl==1.9.4
 attrs==23.2.0
+pdfplumber==0.11.0
