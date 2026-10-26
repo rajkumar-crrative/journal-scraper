@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Ultimate Robust OJS & PDF Scraper for Vercel
+app.py - Vercel-Optimized OJS Scraper with Friend's pdfplumber Corresponding Email Logic
 """
 import io
 import os
@@ -12,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, render_template_string, request
-from pypdf import PdfReader
+import pdfplumber
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -20,7 +20,6 @@ app = Flask(__name__)
 
 MAX_ARTICLES = 40
 PDF_PAGES = 3
-MAX_PDF_BYTES = 25 * 1024 * 1024
 TIMEOUT = (10, 30)
 
 BROWSER_HEADERS = {
@@ -38,14 +37,9 @@ def make_session():
     s.headers.update(BROWSER_HEADERS)
     return s
 
-def decode_html(body, ctype):
-    for enc in ("utf-8", (re.search(r"charset=([\w\-]+)", ctype or "", re.I) or [None, "latin-1"])[1], "latin-1"):
-        try:
-            return body.decode(enc)
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return body.decode("utf-8", "replace")
-
+# ==============================================================================
+# STRICT ARTICLE DISCOVERY (ANNOUNCEMENTS & JUNK BLOCKED)
+# ==============================================================================
 def discover_articles(html_text, issue_url):
     soup = BeautifulSoup(html_text, "html.parser")
     h1 = soup.find("h1")
@@ -60,6 +54,11 @@ def discover_articles(html_text, issue_url):
         href = a["href"].strip()
         full_url = urljoin(issue_url, href)
         
+        # जंक और अनाउंसमेंट पेजों को पूरी तरह इग्नोर करें
+        lower_url = full_url.lower()
+        if any(bad in lower_url for bad in ['announcement', 'about', 'editorial', 'contact', 'submissions', 'privacy', 'login', 'register']):
+            continue
+            
         match = re.search(r'/article/(?:view|download|viewFile)/(\d+)', full_url)
         if not match:
             match = re.search(r'/view/(\d+)/\d+', full_url)
@@ -67,7 +66,11 @@ def discover_articles(html_text, issue_url):
         if match:
             aid = match.group(1)
             if aid not in articles_map:
-                view_url = f"{base_domain}/index.php/jaat/article/view/{aid}"
+                view_url = f"{base_domain}/index.php/jnhrc/article/view/{aid}" if 'jnhrc' in base_domain else f"{base_domain}/index.php/jaat/article/view/{aid}"
+                if '/article/' in full_url:
+                    parts = full_url.split('/article/')
+                    view_url = f"{parts[0]}/article/view/{aid}"
+                
                 articles_map[aid] = {
                     "id": aid,
                     "title": f"Research Article #{aid}",
@@ -86,6 +89,9 @@ def discover_articles(html_text, issue_url):
 
     return issue_title, list(articles_map.values())[:MAX_ARTICLES]
 
+# ==============================================================================
+# FRIEND'S PDFPLUMBER CORRESPONDING AUTHOR LOGIC
+# ==============================================================================
 BLOCKED_PREFIXES = {
     "info", "support", "editor", "editors", "editorial", "editorialoffice", "editorinchief",
     "admin", "administrator", "queries", "webmaster", "noreply", "contact", "office",
@@ -103,18 +109,6 @@ def base_domain(host):
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
 
-EMAIL_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9._%+\-]{0,63})@((?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24})")
-
-def find_emails(text):
-    text = unicodedata.normalize("NFKC", text or "")
-    found = []
-    for m in EMAIL_RE.finditer(text):
-        local, domain = m.group(1).lower().strip(".-"), m.group(2).lower()
-        email = f"{local}@{domain}"
-        if email not in found:
-            found.append(email)
-    return found
-
 def is_allowed(email, journal_base):
     local, _, domain = email.partition("@")
     if domain == journal_base or domain.endswith("." + journal_base):
@@ -123,6 +117,43 @@ def is_allowed(email, journal_base):
         return False
     norm = re.sub(r"[^a-z]", "", local)
     return norm not in BLOCKED_PREFIXES
+
+def extract_emails_from_pdf_bytes(pdf_bytes, journal_base):
+    all_emails = set()
+    corresponding_emails = set()
+    email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_index, page in enumerate(pdf.pages[:PDF_PAGES]):
+                text = page.extract_text()
+                if not text:
+                    continue
+                
+                # 1. स्टैंडर्ड ईमेल निकालना
+                found_emails = re.findall(email_regex, text)
+                for email in found_emails:
+                    em_lower = email.lower().strip(".-")
+                    if not em_lower.endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                        if is_allowed(em_lower, journal_base):
+                            all_emails.add(em_lower)
+                
+                # 2. Corresponding Author लॉजिक (आपके फ्रेंड का कोड)
+                lines = text.split('\n')
+                for line in lines:
+                    line_lower = line.lower()
+                    if any(keyword in line_lower for keyword in ['corresponding', 'author', 'corresp', '*', 'e-mail:', 'email:']):
+                        line_emails = re.findall(email_regex, line)
+                        for em in line_emails:
+                            em_lower = em.lower().strip(".-")
+                            if is_allowed(em_lower, journal_base):
+                                corresponding_emails.add(em_lower)
+        
+        # प्राथमिकता corresponding authors को दें, अगर न मिले तो बाकी सभी यूनिक ईमेल लें
+        final_list = list(corresponding_emails) if corresponding_emails else list(all_emails)
+        return final_list
+    except Exception:
+        return []
 
 def process_single_article(session, art, journal_base):
     candidates = list(art["pdf_candidates"])
@@ -156,38 +187,32 @@ def process_single_article(session, art, journal_base):
     except Exception:
         pass
 
-    # 1. पहले PDF से ईमेल ढूँढने की कोशिश करें
-    pdf_data = None
+    # PDF डाउनलोड करें और pdfplumber से प्रोसेस करें
+    extracted = []
     for url in candidates:
         try:
             r = session.get(url, timeout=TIMEOUT, headers=BROWSER_HEADERS)
             if r.status_code == 200 and len(r.content) > 1000:
-                pdf_data = r.content
-                break
+                extracted = extract_emails_from_pdf_bytes(r.content, journal_base)
+                if extracted:
+                    art["pdf_url"] = url
+                    break
         except Exception:
             continue
             
-    extracted = []
-    if pdf_data:
-        try:
-            reader = PdfReader(io.BytesIO(pdf_data), strict=False)
-            if reader.is_encrypted:
-                reader.decrypt("")
-            full_pdf_text = ""
-            for page in reader.pages[:PDF_PAGES]:
-                full_pdf_text += (page.extract_text() or "") + "\n"
-            extracted = [e for e in find_emails(full_pdf_text) if is_allowed(e, journal_base)]
-        except Exception:
-            pass
-
-    # 2. अगर PDF से ईमेल न मिले, तो HTML पेज से फॉलबैक करके ढूँढें (Fallback to HTML metadata/text)
+    # अगर PDF से न मिले, HTML से फॉलबैक करें
     if not extracted and html_raw_text:
-        extracted = [e for e in find_emails(html_raw_text) if is_allowed(e, journal_base)]
+        email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        found = re.findall(email_regex, html_raw_text)
+        extracted = [e.lower() for e in found if is_allowed(e.lower(), journal_base)]
 
     status = "ok" if extracted else "no_emails"
-    note = "" if extracted else "No author email found in PDF/HTML."
+    note = "" if extracted else "No author email found."
     return extracted, status, note
 
+# ==============================================================================
+# FLASK ROUTES & UI
+# ==============================================================================
 @app.route("/")
 def index():
     return render_template_string(PAGE)
@@ -208,7 +233,7 @@ def api_scrape():
         
         issue_title, arts = discover_articles(r.text, url)
         if not arts:
-            return jsonify({"error": "No articles found in this issue URL."}), 400
+            return jsonify({"error": "No valid research articles found in this issue URL."}), 400
             
         journal_base = base_domain(urlparse(url).hostname or "")
         
@@ -249,7 +274,7 @@ PAGE = r"""<!doctype html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Robust OJS Scraper</title>
+    <title>OJS Corresponding Author Scraper</title>
     <style>
         body { font-family: sans-serif; background: #0b0f19; color: #fff; padding: 30px; max-width: 900px; margin: auto; }
         .card { background: #172036; padding: 25px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
@@ -263,8 +288,8 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
     <div class="card">
-        <h2>👑 Robust OJS PDF & HTML Scraper</h2>
-        <input id="url" type="text" placeholder="Paste Issue URL (e.g., https://jaat.fudutsinma.edu.ng/index.php/jaat/issue/view/19)">
+        <h2>👑 OJS Corresponding Author Scraper (pdfplumber)</h2>
+        <input id="url" type="text" placeholder="Paste Issue URL (e.g., https://www.jnhrc.com.np/index.php/jnhrc/issue/view/150)">
         <button onclick="startScraping()">Launch Extraction</button>
         <div id="status" style="margin-top:15px;color:#94a3b8">Ready</div>
     </div>
@@ -288,13 +313,13 @@ PAGE = r"""<!doctype html>
             if(!url) return alert('कृपया OJS Issue URL डालें!');
             
             const statusEl = document.getElementById('status');
-            statusEl.innerText = 'Scanning PDFs and fallback HTML... Please wait.';
+            statusEl.innerText = 'Extracting corresponding author emails using pdfplumber... Please wait.';
             
             try {
                 const res = await fetch('/api/scrape', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({url: url})
+                body: JSON.stringify({url: url})
                 });
                 const data = await res.json();
                 
@@ -328,7 +353,7 @@ PAGE = r"""<!doctype html>
 
         function copyAllEmails() {
             if(!currentEmails.length) return alert('कॉपी करने के लिए कोई ईमेल नहीं है!');
-            navigator.clipboard.writeText(currentEmails.join('\\n'));
+            navigator.clipboard.writeText(currentEmails.join('\n'));
             alert('Copied ' + currentEmails.length + ' emails to clipboard!');
         }
     </script>
